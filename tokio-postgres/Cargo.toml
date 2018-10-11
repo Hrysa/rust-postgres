@@ -14,7 +14,7 @@ features = [
     "with-bit-vec-0.5",
     "with-chrono-0.4",
     "with-eui48-0.3",
-    "with-geo-0.8",
+    "with-geo-0.10",
     "with-serde_json-1",
     "with-uuid-0.6",
     "with-openssl",
@@ -27,7 +27,7 @@ circle-ci = { repository = "sfackler/rust-postgres" }
 "with-bit-vec-0.5" = ["postgres-shared/with-bit-vec-0.5"]
 "with-chrono-0.4" = ["postgres-shared/with-chrono-0.4"]
 "with-eui48-0.3" = ["postgres-shared/with-eui48-0.3"]
-"with-geo-0.8" = ["postgres-shared/with-geo-0.8"]
+"with-geo-0.10" = ["postgres-shared/with-geo-0.10"]
 "with-serde_json-1" = ["postgres-shared/with-serde_json-1"]
 "with-uuid-0.6" = ["postgres-shared/with-uuid-0.6"]
 
@@ -39,6 +39,7 @@ futures = "0.1.7"
 futures-cpupool = "0.1"
 lazy_static = "1.0"
 log = "0.4"
+phf = "=0.7.22"
 postgres-protocol = { version = "0.3.0", path = "../postgres-protocol" }
 postgres-shared = { version = "0.4.0", path = "../postgres-shared" }
 state_machine_future = "0.1.7"
@@ -48,7 +49,7 @@ tokio-tcp = "0.1"
 tokio-timer = "0.2"
 
 [target.'cfg(unix)'.dependencies]
-tokio-uds = "0.2"
+tokio-uds = "0.2.1"
 
 [dev-dependencies]
 tokio = "0.1.7"

@@ -3,10 +3,9 @@ use futures::{Poll, Stream};
 use postgres_protocol::message::backend::Message;
 use state_machine_future::RentToOwn;
 
-use error::{self, Error};
 use proto::client::{Client, PendingRequest};
 use proto::statement::Statement;
-use {bad_response, disconnected};
+use Error;
 
 #[derive(StateMachineFuture)]
 pub enum Execute {
@@ -16,13 +15,8 @@ pub enum Execute {
         request: PendingRequest,
         statement: Statement,
     },
-    #[state_machine_future(transitions(ReadReadyForQuery))]
-    ReadResponse { receiver: mpsc::Receiver<Message> },
     #[state_machine_future(transitions(Finished))]
-    ReadReadyForQuery {
-        receiver: mpsc::Receiver<Message>,
-        rows: u64,
-    },
+    ReadResponse { receiver: mpsc::Receiver<Message> },
     #[state_machine_future(ready)]
     Finished(u64),
     #[state_machine_future(error)]
@@ -42,42 +36,27 @@ impl PollExecute for Execute {
         state: &'a mut RentToOwn<'a, ReadResponse>,
     ) -> Poll<AfterReadResponse, Error> {
         loop {
-            let message = try_receive!(state.receiver.poll());
+            let message = try_ready_receive!(state.receiver.poll());
 
             match message {
                 Some(Message::BindComplete) => {}
                 Some(Message::DataRow(_)) => {}
-                Some(Message::ErrorResponse(body)) => return Err(error::__db(body)),
+                Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
                 Some(Message::CommandComplete(body)) => {
-                    let rows = body.tag()?.rsplit(' ').next().unwrap().parse().unwrap_or(0);
-                    let state = state.take();
-                    transition!(ReadReadyForQuery {
-                        receiver: state.receiver,
-                        rows,
-                    });
+                    let rows = body
+                        .tag()
+                        .map_err(Error::parse)?
+                        .rsplit(' ')
+                        .next()
+                        .unwrap()
+                        .parse()
+                        .unwrap_or(0);
+                    transition!(Finished(rows))
                 }
-                Some(Message::EmptyQueryResponse) => {
-                    let state = state.take();
-                    transition!(ReadReadyForQuery {
-                        receiver: state.receiver,
-                        rows: 0,
-                    });
-                }
-                Some(_) => return Err(bad_response()),
-                None => return Err(disconnected()),
+                Some(Message::EmptyQueryResponse) => transition!(Finished(0)),
+                Some(_) => return Err(Error::unexpected_message()),
+                None => return Err(Error::closed()),
             }
-        }
-    }
-
-    fn poll_read_ready_for_query<'a>(
-        state: &'a mut RentToOwn<'a, ReadReadyForQuery>,
-    ) -> Poll<AfterReadReadyForQuery, Error> {
-        let message = try_receive!(state.receiver.poll());
-
-        match message {
-            Some(Message::ReadyForQuery(_)) => transition!(Finished(state.rows)),
-            Some(_) => Err(bad_response()),
-            None => Err(disconnected()),
         }
     }
 }

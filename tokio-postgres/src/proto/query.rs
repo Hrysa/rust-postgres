@@ -3,31 +3,47 @@ use futures::{Async, Poll, Stream};
 use postgres_protocol::message::backend::Message;
 use std::mem;
 
-use error::{self, Error};
 use proto::client::{Client, PendingRequest};
+use proto::portal::Portal;
 use proto::row::Row;
 use proto::statement::Statement;
-use {bad_response, disconnected};
+use Error;
 
-enum State {
+pub trait StatementHolder {
+    fn statement(&self) -> &Statement;
+}
+
+impl StatementHolder for Statement {
+    fn statement(&self) -> &Statement {
+        self
+    }
+}
+
+impl StatementHolder for Portal {
+    fn statement(&self) -> &Statement {
+        self.statement()
+    }
+}
+
+enum State<T> {
     Start {
         client: Client,
         request: PendingRequest,
-        statement: Statement,
+        statement: T,
     },
     ReadingResponse {
         receiver: mpsc::Receiver<Message>,
-        statement: Statement,
-    },
-    ReadingReadyForQuery {
-        receiver: mpsc::Receiver<Message>,
+        statement: T,
     },
     Done,
 }
 
-pub struct QueryStream(State);
+pub struct QueryStream<T>(State<T>);
 
-impl Stream for QueryStream {
+impl<T> Stream for QueryStream<T>
+where
+    T: StatementHolder,
+{
     type Item = Row;
     type Error = Error;
 
@@ -68,36 +84,22 @@ impl Stream for QueryStream {
                                 statement,
                             };
                         }
-                        Some(Message::ErrorResponse(body)) => break Err(error::__db(body)),
+                        Some(Message::ErrorResponse(body)) => break Err(Error::db(body)),
                         Some(Message::DataRow(body)) => {
-                            let row = Row::new(statement.clone(), body)?;
+                            let row = Row::new(statement.statement().clone(), body)?;
                             self.0 = State::ReadingResponse {
                                 receiver,
                                 statement,
                             };
                             break Ok(Async::Ready(Some(row)));
                         }
-                        Some(Message::EmptyQueryResponse) | Some(Message::CommandComplete(_)) => {
-                            self.0 = State::ReadingReadyForQuery { receiver };
+                        Some(Message::EmptyQueryResponse)
+                        | Some(Message::PortalSuspended)
+                        | Some(Message::CommandComplete(_)) => {
+                            break Ok(Async::Ready(None));
                         }
-                        Some(_) => break Err(bad_response()),
-                        None => break Err(disconnected()),
-                    }
-                }
-                State::ReadingReadyForQuery { mut receiver } => {
-                    let message = match receiver.poll() {
-                        Ok(Async::Ready(message)) => message,
-                        Ok(Async::NotReady) => {
-                            self.0 = State::ReadingReadyForQuery { receiver };
-                            break Ok(Async::NotReady);
-                        }
-                        Err(()) => unreachable!("mpsc::Receiver doesn't return errors"),
-                    };
-
-                    match message {
-                        Some(Message::ReadyForQuery(_)) => break Ok(Async::Ready(None)),
-                        Some(_) => break Err(bad_response()),
-                        None => break Err(disconnected()),
+                        Some(_) => break Err(Error::unexpected_message()),
+                        None => break Err(Error::closed()),
                     }
                 }
                 State::Done => break Ok(Async::Ready(None)),
@@ -106,8 +108,11 @@ impl Stream for QueryStream {
     }
 }
 
-impl QueryStream {
-    pub fn new(client: Client, request: PendingRequest, statement: Statement) -> QueryStream {
+impl<T> QueryStream<T>
+where
+    T: StatementHolder,
+{
+    pub fn new(client: Client, request: PendingRequest, statement: T) -> QueryStream<T> {
         QueryStream(State::Start {
             client,
             request,

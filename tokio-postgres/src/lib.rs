@@ -2,6 +2,7 @@ extern crate antidote;
 extern crate bytes;
 extern crate fallible_iterator;
 extern crate futures_cpupool;
+extern crate phf;
 extern crate postgres_protocol;
 extern crate postgres_shared;
 extern crate tokio_codec;
@@ -21,16 +22,17 @@ extern crate state_machine_future;
 #[cfg(unix)]
 extern crate tokio_uds;
 
+use bytes::Bytes;
 use futures::{Async, Future, Poll, Stream};
 use postgres_shared::rows::RowIndex;
+use std::error::Error as StdError;
 use std::fmt;
-use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[doc(inline)]
 pub use postgres_shared::stmt::Column;
 #[doc(inline)]
-pub use postgres_shared::{error, params, types};
+pub use postgres_shared::{params, types};
 #[doc(inline)]
 pub use postgres_shared::{CancelData, Notification};
 
@@ -39,27 +41,18 @@ use params::ConnectParams;
 use tls::TlsConnect;
 use types::{FromSql, ToSql, Type};
 
+pub mod error;
 mod proto;
 pub mod tls;
 
-static NEXT_STATEMENT_ID: AtomicUsize = AtomicUsize::new(0);
-
 fn next_statement() -> String {
-    format!("s{}", NEXT_STATEMENT_ID.fetch_add(1, Ordering::SeqCst))
+    static ID: AtomicUsize = AtomicUsize::new(0);
+    format!("s{}", ID.fetch_add(1, Ordering::SeqCst))
 }
 
-fn bad_response() -> Error {
-    Error::from(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "the server returned an unexpected response",
-    ))
-}
-
-fn disconnected() -> Error {
-    Error::from(io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        "server disconnected",
-    ))
+fn next_portal() -> String {
+    static ID: AtomicUsize = AtomicUsize::new(0);
+    format!("p{}", ID.fetch_add(1, Ordering::SeqCst))
 }
 
 pub enum TlsMode {
@@ -93,6 +86,37 @@ impl Client {
 
     pub fn query(&mut self, statement: &Statement, params: &[&ToSql]) -> Query {
         Query(self.0.query(&statement.0, params))
+    }
+
+    pub fn bind(&mut self, statement: &Statement, params: &[&ToSql]) -> Bind {
+        Bind(self.0.bind(&statement.0, next_portal(), params))
+    }
+
+    pub fn query_portal(&mut self, portal: &Portal, max_rows: i32) -> QueryPortal {
+        QueryPortal(self.0.query_portal(&portal.0, max_rows))
+    }
+
+    pub fn copy_in<S>(&mut self, statement: &Statement, params: &[&ToSql], stream: S) -> CopyIn<S>
+    where
+        S: Stream,
+        S::Item: AsRef<[u8]>,
+        // FIXME error type?
+        S::Error: Into<Box<StdError + Sync + Send>>,
+    {
+        CopyIn(self.0.copy_in(&statement.0, params, stream))
+    }
+
+    pub fn copy_out(&mut self, statement: &Statement, params: &[&ToSql]) -> CopyOut {
+        CopyOut(self.0.copy_out(&statement.0, params))
+    }
+
+    pub fn transaction<T>(&mut self, future: T) -> Transaction<T>
+    where
+        T: Future,
+        // FIXME error type?
+        T::Error: From<Error>,
+    {
+        Transaction(proto::TransactionFuture::new(self.0.clone(), future))
     }
 
     pub fn batch_execute(&mut self, query: &str) -> BatchExecute {
@@ -198,7 +222,7 @@ impl Future for Execute {
 }
 
 #[must_use = "streams do nothing unless polled"]
-pub struct Query(proto::QueryStream);
+pub struct Query(proto::QueryStream<proto::Statement>);
 
 impl Stream for Query {
     type Item = Row;
@@ -211,6 +235,73 @@ impl Stream for Query {
             Ok(Async::NotReady) => Ok(Async::NotReady),
             Err(e) => Err(e),
         }
+    }
+}
+
+#[must_use = "futures do nothing unless polled"]
+pub struct Bind(proto::BindFuture);
+
+impl Future for Bind {
+    type Item = Portal;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Portal, Error> {
+        match self.0.poll() {
+            Ok(Async::Ready(portal)) => Ok(Async::Ready(Portal(portal))),
+            Ok(Async::NotReady) => Ok(Async::NotReady),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[must_use = "streams do nothing unless polled"]
+pub struct QueryPortal(proto::QueryStream<proto::Portal>);
+
+impl Stream for QueryPortal {
+    type Item = Row;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Option<Row>, Error> {
+        match self.0.poll() {
+            Ok(Async::Ready(Some(row))) => Ok(Async::Ready(Some(Row(row)))),
+            Ok(Async::Ready(None)) => Ok(Async::Ready(None)),
+            Ok(Async::NotReady) => Ok(Async::NotReady),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+pub struct Portal(proto::Portal);
+
+#[must_use = "futures do nothing unless polled"]
+pub struct CopyIn<S>(proto::CopyInFuture<S>)
+where
+    S: Stream,
+    S::Item: AsRef<[u8]>,
+    S::Error: Into<Box<StdError + Sync + Send>>;
+
+impl<S> Future for CopyIn<S>
+where
+    S: Stream<Item = Vec<u8>>,
+    S::Error: Into<Box<StdError + Sync + Send>>,
+{
+    type Item = u64;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<u64, Error> {
+        self.0.poll()
+    }
+}
+
+#[must_use = "streams do nothing unless polled"]
+pub struct CopyOut(proto::CopyOutStream);
+
+impl Stream for CopyOut {
+    type Item = Bytes;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Option<Bytes>, Error> {
+        self.0.poll()
     }
 }
 
@@ -239,6 +330,25 @@ impl Row {
         T: FromSql<'a>,
     {
         self.0.try_get(idx)
+    }
+}
+
+#[must_use = "futures do nothing unless polled"]
+pub struct Transaction<T>(proto::TransactionFuture<T, T::Item, T::Error>)
+where
+    T: Future,
+    T::Error: From<Error>;
+
+impl<T> Future for Transaction<T>
+where
+    T: Future,
+    T::Error: From<Error>,
+{
+    type Item = T::Item;
+    type Error = T::Error;
+
+    fn poll(&mut self) -> Poll<T::Item, T::Error> {
+        self.0.poll()
     }
 }
 

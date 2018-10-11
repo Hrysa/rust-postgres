@@ -8,7 +8,9 @@ extern crate futures;
 extern crate log;
 
 use futures::future;
+use futures::stream;
 use futures::sync::mpsc;
+use std::error::Error;
 use std::time::{Duration, Instant};
 use tokio::prelude::*;
 use tokio::runtime::current_thread::Runtime;
@@ -48,11 +50,7 @@ fn plain_password_missing() {
         "postgres://pass_user@localhost:5433".parse().unwrap(),
         TlsMode::None,
     );
-    match runtime.block_on(handshake) {
-        Ok(_) => panic!("unexpected success"),
-        Err(ref e) if e.as_connection().is_some() => {}
-        Err(e) => panic!("{}", e),
-    }
+    runtime.block_on(handshake).err().unwrap();
 }
 
 #[test]
@@ -85,11 +83,7 @@ fn md5_password_missing() {
         "postgres://md5_user@localhost:5433".parse().unwrap(),
         TlsMode::None,
     );
-    match runtime.block_on(handshake) {
-        Ok(_) => panic!("unexpected success"),
-        Err(ref e) if e.as_connection().is_some() => {}
-        Err(e) => panic!("{}", e),
-    }
+    runtime.block_on(handshake).err().unwrap();
 }
 
 #[test]
@@ -122,11 +116,7 @@ fn scram_password_missing() {
         "postgres://scram_user@localhost:5433".parse().unwrap(),
         TlsMode::None,
     );
-    match runtime.block_on(handshake) {
-        Ok(_) => panic!("unexpected success"),
-        Err(ref e) if e.as_connection().is_some() => {}
-        Err(e) => panic!("{}", e),
-    }
+    runtime.block_on(handshake).err().unwrap();
 }
 
 #[test]
@@ -209,6 +199,49 @@ fn insert_select() {
 }
 
 #[test]
+fn query_portal() {
+    let _ = env_logger::try_init();
+    let mut runtime = Runtime::new().unwrap();
+
+    let handshake = tokio_postgres::connect(
+        "postgres://postgres@localhost:5433".parse().unwrap(),
+        TlsMode::None,
+    );
+    let (mut client, connection) = runtime.block_on(handshake).unwrap();
+    let connection = connection.map_err(|e| panic!("{}", e));
+    runtime.handle().spawn(connection).unwrap();
+
+    runtime
+        .block_on(client.batch_execute(
+            "CREATE TEMPORARY TABLE foo (id SERIAL, name TEXT);
+             INSERT INTO foo (name) VALUES ('alice'), ('bob'), ('charlie');
+             BEGIN;",
+        )).unwrap();
+
+    let statement = runtime
+        .block_on(client.prepare("SELECT id, name FROM foo ORDER BY id"))
+        .unwrap();
+    let portal = runtime.block_on(client.bind(&statement, &[])).unwrap();
+
+    let f1 = client.query_portal(&portal, 2).collect();
+    let f2 = client.query_portal(&portal, 2).collect();
+    let f3 = client.query_portal(&portal, 2).collect();
+    let (r1, r2, r3) = runtime.block_on(f1.join3(f2, f3)).unwrap();
+
+    assert_eq!(r1.len(), 2);
+    assert_eq!(r1[0].get::<_, i32>(0), 1);
+    assert_eq!(r1[0].get::<_, &str>(1), "alice");
+    assert_eq!(r1[1].get::<_, i32>(0), 2);
+    assert_eq!(r1[1].get::<_, &str>(1), "bob");
+
+    assert_eq!(r2.len(), 1);
+    assert_eq!(r2[0].get::<_, i32>(0), 3);
+    assert_eq!(r2[0].get::<_, &str>(1), "charlie");
+
+    assert_eq!(r3.len(), 0);
+}
+
+#[test]
 fn cancel_query() {
     let _ = env_logger::try_init();
     let mut runtime = Runtime::new().unwrap();
@@ -237,8 +270,7 @@ fn cancel_query() {
                 TlsMode::None,
                 cancel_data,
             )
-        })
-        .then(|r| {
+        }).then(|r| {
             r.unwrap();
             Ok::<(), ()>(())
         });
@@ -266,8 +298,7 @@ fn custom_enum() {
                 'ok',
                 'happy'
             )",
-        ))
-        .unwrap();
+        )).unwrap();
 
     let select = client.prepare("SELECT $1::mood");
     let select = runtime.block_on(select).unwrap();
@@ -300,8 +331,7 @@ fn custom_domain() {
     runtime
         .block_on(client.batch_execute(
             "CREATE DOMAIN pg_temp.session_id AS bytea CHECK(octet_length(VALUE) = 16)",
-        ))
-        .unwrap();
+        )).unwrap();
 
     let select = client.prepare("SELECT $1::session_id");
     let select = runtime.block_on(select).unwrap();
@@ -358,8 +388,7 @@ fn custom_composite() {
                 supplier INTEGER,
                 price NUMERIC
             )",
-        ))
-        .unwrap();
+        )).unwrap();
 
     let select = client.prepare("SELECT $1::inventory_item");
     let select = runtime.block_on(select).unwrap();
@@ -398,8 +427,7 @@ fn custom_range() {
                 subtype = float8,
                 subtype_diff = float8mi
             )",
-        ))
-        .unwrap();
+        )).unwrap();
 
     let select = client.prepare("SELECT $1::floatrange");
     let select = runtime.block_on(select).unwrap();
@@ -476,4 +504,191 @@ fn notifications() {
     assert_eq!(notifications[0].payload, "hello");
     assert_eq!(notifications[1].channel, "test_notifications");
     assert_eq!(notifications[1].payload, "world");
+}
+
+#[test]
+fn transaction_commit() {
+    let _ = env_logger::try_init();
+    let mut runtime = Runtime::new().unwrap();
+
+    let (mut client, connection) = runtime
+        .block_on(tokio_postgres::connect(
+            "postgres://postgres@localhost:5433".parse().unwrap(),
+            TlsMode::None,
+        )).unwrap();
+    let connection = connection.map_err(|e| panic!("{}", e));
+    runtime.handle().spawn(connection).unwrap();
+
+    runtime
+        .block_on(client.batch_execute(
+            "CREATE TEMPORARY TABLE foo (
+                id SERIAL,
+                name TEXT
+            )",
+        )).unwrap();
+
+    let f = client.batch_execute("INSERT INTO foo (name) VALUES ('steven')");
+    runtime.block_on(client.transaction(f)).unwrap();
+
+    let rows = runtime
+        .block_on(
+            client
+                .prepare("SELECT name FROM foo")
+                .and_then(|s| client.query(&s, &[]).collect()),
+        ).unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>(0), "steven");
+}
+
+#[test]
+fn transaction_abort() {
+    let _ = env_logger::try_init();
+    let mut runtime = Runtime::new().unwrap();
+
+    let (mut client, connection) = runtime
+        .block_on(tokio_postgres::connect(
+            "postgres://postgres@localhost:5433".parse().unwrap(),
+            TlsMode::None,
+        )).unwrap();
+    let connection = connection.map_err(|e| panic!("{}", e));
+    runtime.handle().spawn(connection).unwrap();
+
+    runtime
+        .block_on(client.batch_execute(
+            "CREATE TEMPORARY TABLE foo (
+                id SERIAL,
+                name TEXT
+            )",
+        )).unwrap();
+
+    let f = client
+        .batch_execute("INSERT INTO foo (name) VALUES ('steven')")
+        .map_err(|e| Box::new(e) as Box<Error>)
+        .and_then(|_| Err::<(), _>(Box::<Error>::from("")));
+    runtime.block_on(client.transaction(f)).unwrap_err();
+
+    let rows = runtime
+        .block_on(
+            client
+                .prepare("SELECT name FROM foo")
+                .and_then(|s| client.query(&s, &[]).collect()),
+        ).unwrap();
+
+    assert_eq!(rows.len(), 0);
+}
+
+#[test]
+fn copy_in() {
+    let _ = env_logger::try_init();
+    let mut runtime = Runtime::new().unwrap();
+
+    let (mut client, connection) = runtime
+        .block_on(tokio_postgres::connect(
+            "postgres://postgres@localhost:5433".parse().unwrap(),
+            TlsMode::None,
+        )).unwrap();
+    let connection = connection.map_err(|e| panic!("{}", e));
+    runtime.handle().spawn(connection).unwrap();
+
+    runtime
+        .block_on(client.batch_execute(
+            "CREATE TEMPORARY TABLE foo (
+                id INTEGER,
+                name TEXT
+             )",
+        )).unwrap();
+
+    let stream = stream::iter_ok::<_, String>(vec![b"1\tjim\n".to_vec(), b"2\tjoe\n".to_vec()]);
+    let rows = runtime
+        .block_on(
+            client
+                .prepare("COPY foo FROM STDIN")
+                .and_then(|s| client.copy_in(&s, &[], stream)),
+        ).unwrap();
+    assert_eq!(rows, 2);
+
+    let rows = runtime
+        .block_on(
+            client
+                .prepare("SELECT id, name FROM foo ORDER BY id")
+                .and_then(|s| client.query(&s, &[]).collect()),
+        ).unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(rows[0].get::<_, &str>(1), "jim");
+    assert_eq!(rows[1].get::<_, i32>(0), 2);
+    assert_eq!(rows[1].get::<_, &str>(1), "joe");
+}
+
+#[test]
+fn copy_in_error() {
+    let _ = env_logger::try_init();
+    let mut runtime = Runtime::new().unwrap();
+
+    let (mut client, connection) = runtime
+        .block_on(tokio_postgres::connect(
+            "postgres://postgres@localhost:5433".parse().unwrap(),
+            TlsMode::None,
+        )).unwrap();
+    let connection = connection.map_err(|e| panic!("{}", e));
+    runtime.handle().spawn(connection).unwrap();
+
+    runtime
+        .block_on(client.batch_execute(
+            "CREATE TEMPORARY TABLE foo (
+                id INTEGER,
+                name TEXT
+             )",
+        )).unwrap();
+
+    let stream = stream::iter_result(vec![Ok(b"1\tjim\n".to_vec()), Err("asdf")]);
+    let error = runtime
+        .block_on(
+            client
+                .prepare("COPY foo FROM STDIN")
+                .and_then(|s| client.copy_in(&s, &[], stream)),
+        ).unwrap_err();
+    assert!(error.to_string().contains("asdf"));
+
+    let rows = runtime
+        .block_on(
+            client
+                .prepare("SELECT id, name FROM foo ORDER BY id")
+                .and_then(|s| client.query(&s, &[]).collect()),
+        ).unwrap();
+
+    assert_eq!(rows.len(), 0);
+}
+
+#[test]
+fn copy_out() {
+    let _ = env_logger::try_init();
+    let mut runtime = Runtime::new().unwrap();
+
+    let (mut client, connection) = runtime
+        .block_on(tokio_postgres::connect(
+            "postgres://postgres@localhost:5433".parse().unwrap(),
+            TlsMode::None,
+        )).unwrap();
+    let connection = connection.map_err(|e| panic!("{}", e));
+    runtime.handle().spawn(connection).unwrap();
+
+    runtime
+        .block_on(client.batch_execute(
+            "CREATE TEMPORARY TABLE foo (
+                id SERIAL,
+                name TEXT
+            );
+            INSERT INTO foo (name) VALUES ('jim'), ('joe');",
+        )).unwrap();
+
+    let data = runtime
+        .block_on(
+            client
+                .prepare("COPY foo TO STDOUT")
+                .and_then(|s| client.copy_out(&s, &[]).concat2()),
+        ).unwrap();
+    assert_eq!(&data[..], b"1\tjim\n2\tjoe\n");
 }

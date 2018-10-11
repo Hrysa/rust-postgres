@@ -1,22 +1,27 @@
 use antidote::Mutex;
 use futures::sync::mpsc;
+use futures::{AsyncSink, Sink, Stream};
 use postgres_protocol;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::sync::{Arc, Weak};
 
-use disconnected;
-use error::{self, Error};
-use proto::connection::Request;
+use proto::bind::BindFuture;
+use proto::connection::{Request, RequestMessages};
+use proto::copy_in::{CopyInFuture, CopyInReceiver, CopyMessage};
+use proto::copy_out::CopyOutStream;
 use proto::execute::ExecuteFuture;
+use proto::portal::Portal;
 use proto::prepare::PrepareFuture;
 use proto::query::QueryStream;
 use proto::simple_query::SimpleQueryFuture;
 use proto::statement::Statement;
 use types::{IsNull, Oid, ToSql, Type};
+use Error;
 
-pub struct PendingRequest(Result<Vec<u8>, Error>);
+pub struct PendingRequest(Result<RequestMessages, Error>);
 
 pub struct WeakClient(Weak<Inner>);
 
@@ -97,12 +102,12 @@ impl Client {
             .sender
             .unbounded_send(Request { messages, sender })
             .map(|_| receiver)
-            .map_err(|_| disconnected())
+            .map_err(|_| Error::closed())
     }
 
     pub fn batch_execute(&self, query: &str) -> SimpleQueryFuture {
         let pending = self.pending(|buf| {
-            frontend::query(query, buf)?;
+            frontend::query(query, buf).map_err(Error::parse)?;
             Ok(())
         });
 
@@ -111,8 +116,9 @@ impl Client {
 
     pub fn prepare(&self, name: String, query: &str, param_types: &[Type]) -> PrepareFuture {
         let pending = self.pending(|buf| {
-            frontend::parse(&name, query, param_types.iter().map(|t| t.oid()), buf)?;
-            frontend::describe(b'S', &name, buf)?;
+            frontend::parse(&name, query, param_types.iter().map(|t| t.oid()), buf)
+                .map_err(Error::parse)?;
+            frontend::describe(b'S', &name, buf).map_err(Error::parse)?;
             frontend::sync(buf);
             Ok(())
         });
@@ -121,50 +127,118 @@ impl Client {
     }
 
     pub fn execute(&self, statement: &Statement, params: &[&ToSql]) -> ExecuteFuture {
-        let pending = self.pending_execute(statement, params);
+        let pending = PendingRequest(
+            self.excecute_message(statement, params)
+                .map(RequestMessages::Single),
+        );
         ExecuteFuture::new(self.clone(), pending, statement.clone())
     }
 
-    pub fn query(&self, statement: &Statement, params: &[&ToSql]) -> QueryStream {
-        let pending = self.pending_execute(statement, params);
+    pub fn query(&self, statement: &Statement, params: &[&ToSql]) -> QueryStream<Statement> {
+        let pending = PendingRequest(
+            self.excecute_message(statement, params)
+                .map(RequestMessages::Single),
+        );
         QueryStream::new(self.clone(), pending, statement.clone())
     }
 
+    pub fn bind(&self, statement: &Statement, name: String, params: &[&ToSql]) -> BindFuture {
+        let mut buf = self.bind_message(statement, &name, params);
+        if let Ok(ref mut buf) = buf {
+            frontend::sync(buf);
+        }
+        let pending = PendingRequest(buf.map(RequestMessages::Single));
+        BindFuture::new(self.clone(), pending, name, statement.clone())
+    }
+
+    pub fn query_portal(&self, portal: &Portal, rows: i32) -> QueryStream<Portal> {
+        let pending = self.pending(|buf| {
+            frontend::execute(portal.name(), rows, buf).map_err(Error::parse)?;
+            frontend::sync(buf);
+            Ok(())
+        });
+        QueryStream::new(self.clone(), pending, portal.clone())
+    }
+
+    pub fn copy_in<S>(&self, statement: &Statement, params: &[&ToSql], stream: S) -> CopyInFuture<S>
+    where
+        S: Stream,
+        S::Item: AsRef<[u8]>,
+        S::Error: Into<Box<StdError + Sync + Send>>,
+    {
+        let (mut sender, receiver) = mpsc::channel(0);
+        let pending = PendingRequest(self.excecute_message(statement, params).map(|buf| {
+            match sender.start_send(CopyMessage::Data(buf)) {
+                Ok(AsyncSink::Ready) => {}
+                _ => unreachable!("channel should have capacity"),
+            }
+            RequestMessages::CopyIn {
+                receiver: CopyInReceiver::new(receiver),
+                pending_message: None,
+            }
+        }));
+        CopyInFuture::new(self.clone(), pending, statement.clone(), stream, sender)
+    }
+
+    pub fn copy_out(&self, statement: &Statement, params: &[&ToSql]) -> CopyOutStream {
+        let pending = PendingRequest(
+            self.excecute_message(statement, params)
+                .map(RequestMessages::Single),
+        );
+        CopyOutStream::new(self.clone(), pending, statement.clone())
+    }
+
     pub fn close_statement(&self, name: &str) {
+        self.close(b'S', name)
+    }
+
+    pub fn close_portal(&self, name: &str) {
+        self.close(b'P', name)
+    }
+
+    fn close(&self, ty: u8, name: &str) {
         let mut buf = vec![];
-        frontend::close(b'S', name, &mut buf).expect("statement name not valid");
+        frontend::close(ty, name, &mut buf).expect("statement name not valid");
         frontend::sync(&mut buf);
         let (sender, _) = mpsc::channel(0);
         let _ = self.0.sender.unbounded_send(Request {
-            messages: buf,
+            messages: RequestMessages::Single(buf),
             sender,
         });
     }
 
-    fn pending_execute(&self, statement: &Statement, params: &[&ToSql]) -> PendingRequest {
-        self.pending(|buf| {
-            let r = frontend::bind(
-                "",
-                statement.name(),
-                Some(1),
-                params.iter().zip(statement.params()),
-                |(param, ty), buf| match param.to_sql_checked(ty, buf) {
-                    Ok(IsNull::No) => Ok(postgres_protocol::IsNull::No),
-                    Ok(IsNull::Yes) => Ok(postgres_protocol::IsNull::Yes),
-                    Err(e) => Err(e),
-                },
-                Some(1),
-                buf,
-            );
-            match r {
-                Ok(()) => {}
-                Err(frontend::BindError::Conversion(e)) => return Err(error::conversion(e)),
-                Err(frontend::BindError::Serialization(e)) => return Err(Error::from(e)),
-            }
-            frontend::execute("", 0, buf)?;
-            frontend::sync(buf);
-            Ok(())
-        })
+    fn bind_message(
+        &self,
+        statement: &Statement,
+        name: &str,
+        params: &[&ToSql],
+    ) -> Result<Vec<u8>, Error> {
+        let mut buf = vec![];
+        let r = frontend::bind(
+            name,
+            statement.name(),
+            Some(1),
+            params.iter().zip(statement.params()),
+            |(param, ty), buf| match param.to_sql_checked(ty, buf) {
+                Ok(IsNull::No) => Ok(postgres_protocol::IsNull::No),
+                Ok(IsNull::Yes) => Ok(postgres_protocol::IsNull::Yes),
+                Err(e) => Err(e),
+            },
+            Some(1),
+            &mut buf,
+        );
+        match r {
+            Ok(()) => Ok(buf),
+            Err(frontend::BindError::Conversion(e)) => return Err(Error::to_sql(e)),
+            Err(frontend::BindError::Serialization(e)) => return Err(Error::encode(e)),
+        }
+    }
+
+    fn excecute_message(&self, statement: &Statement, params: &[&ToSql]) -> Result<Vec<u8>, Error> {
+        let mut buf = self.bind_message(statement, "", params)?;
+        frontend::execute("", 0, &mut buf).map_err(Error::parse)?;
+        frontend::sync(&mut buf);
+        Ok(buf)
     }
 
     fn pending<F>(&self, messages: F) -> PendingRequest
@@ -172,6 +246,6 @@ impl Client {
         F: FnOnce(&mut Vec<u8>) -> Result<(), Error>,
     {
         let mut buf = vec![];
-        PendingRequest(messages(&mut buf).map(|()| buf))
+        PendingRequest(messages(&mut buf).map(|()| RequestMessages::Single(buf)))
     }
 }
